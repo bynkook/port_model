@@ -34,12 +34,12 @@ pd.set_option("display.width", 200)
 THIS_YEAR = 2025
 RANDOM_STATE = 42
 
-#----------------------------------
-#      사용자 지정 전역변수
-MODEL_ID = 1 
-USE_OPTUNA = True   # 최적파라메터 탐색 on/off 스위치
-STACK_PASSTHROUGH = False       # stacking 할때 True 면 oof prediction + X data 로 final estimator 에 전달. False 면 oof prediction 만 전달
-#----------------------------------
+# --- 사용자 지정 전역변수 ----
+MODEL_ID = 4
+USE_OPTUNA = False
+STACK_PASSTHROUGH = True
+N_TRIALS = 10
+# ------------------------------
 
 INPUT_DIR = Path("./input")
 OUTPUT_DIR = Path("./output_model") / f"model_{MODEL_ID}"
@@ -53,18 +53,25 @@ COL_OPERATION = ['NIS', 'NOS', 'FIS', 'FOS', 'CIS', 'COS', 'NIGT', 'NOGT', 'FIGT
 
 
 def load_and_prepare(path_csv: str = "data.csv") -> pd.DataFrame:
-    """CSV 로드 후 년, 월 파생. data2.csv 로 저장."""
-    df = pd.read_csv(path_csv)
-    df = df[COL_TIME + COL_WEATHER + COL_OPERATION] # 전역변수에 정의된 데이터셋의 컬럼만 저장
+    """ CSV 로드 후 년, 월 파생변수 컬럼을 생성. 필요없는 컬럼 삭제 후 data2.csv 저장 """
+    # csv 파일 로드
+    df = pd.read_csv(path_csv, sep='\t')    # csv 파일은 tab 으로 구분되어 있음
 
-    # datetime 형식 변환, year & month 생성    
-    df['datetime'] = pd.to_datetime(df['사용연월'], errors='raise', format="%Y년%m월")
+    # 전역변수에 정의된 데이터셋의 컬럼만 사용함
+    df = df[COL_TIME + COL_WEATHER + COL_OPERATION]
+
+    # datetime 형식 변환, year & month 생성
+    df['datetime'] = pd.to_datetime(df['사용년월'], errors='raise', format="%Y년%m월")  # '2025년03월' 문자열을format 을 지정하여 읽음
     df['year'] = df['datetime'].dt.year
     df['month'] = df['datetime'].dt.month
+
     # 파생변수 생성
-    df['weather_bad_ratio'] = df[COL_WEATHER].sum() / df['전체일수']
+    df['weather_bad_ratio'] = df[COL_WEATHER].sum(axis=1) / df['전체일수']
+    df['weather_bad_ratio'] = df['weather_bad_ratio'].round(4)
+
     # 분석에 필요없는 데이터 컬럼 삭제
-    df.drop(columns=['사용연월', 'datetime'], inplace=True, errors='raise')
+    df.drop(columns=['사용년월', 'datetime'], inplace=True, errors='raise')
+
     # 파일로 저장(사용자 확인용)
     df.to_csv("data2.csv", index=False)
 
@@ -75,9 +82,10 @@ def create_weather_score(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray]:
     weather_features = [c for c in COL_WEATHER if c in data.columns]
     weather_data = data[weather_features].fillna(0).to_numpy(dtype=float)
 
-    # weight 사용자 입력(날씨정보컬럼수 = 7개), 전체 절대값 합은 1.0
-    # 테이블 컬럼명 출력해보고 컬럼 순서에 맞게 입력
-    weights = [0.1, 0.2, 0.2, 0.3, 0.1, 0.05, 0.05]
+    # ---- weights는 사용자가 수정해야함 ----
+    weights = [0.15, 0.1, 0.3, 0.2, 0.05, 0.15, 0.05] # 2025-09-19 설정 저장
+
+    # weather 데이터 컬럼들과 가중치의 곱
     risk_score = weather_data.dot(weights)
 
     percentiles = np.percentile(risk_score, [20, 40, 60, 80])
@@ -94,23 +102,67 @@ def create_weather_score(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray]:
         else:
             return 1
 
+    # weather_score 컬럼에 날씨점수 저장
     data['weather_score'] = [assign(s) for s in risk_score]
+
+    # percentiles 는 저장해두고 새로운 데이터 들어올때 사용해야 한다.
+    return data, percentiles
+
+def create_weather_score_for_predict_new(df: pd.DataFrame, percentiles: np.ndarray) -> pd.DataFrame:
+    data = df.copy()
+    weather_features = [c for c in COL_WEATHER if c in data.columns]
+    weather_data = data[weather_features].fillna(0).to_numpy(dtype=float)
+
+    # ---- weights는 사용자가 수정해야함 ----
+    weights = [0.15, 0.1, 0.3, 0.2, 0.05, 0.15, 0.05] # 2025-09-19 설정 저장
+
+    # weather 데이터 컬럼들과 가중치의 곱
+    risk_score = weather_data.dot(weights)
+
+    # percentiles 훈련시 값을 가져와서 사용
+    def assign(score: float) -> int:
+        if score <= percentiles[0]:
+            return 5
+        elif score <= percentiles[1]:
+            return 4
+        elif score <= percentiles[2]:
+            return 3
+        elif score <= percentiles[3]:
+            return 2
+        else:
+            return 1
+
+    # weather_score 컬럼에 날씨점수 저장
+    data['weather_score'] = [assign(s) for s in risk_score]
+
     return data
 
 
 def create_data_age(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
     age = THIS_YEAR - data['year'].astype(int)
-    bins = [-np.inf, 0.5, 1.5, 2.5, 3.5, np.inf]        # 5단계 구간 분리
-    labels = [5.0, 4.8, 4.6, 4.4, 4.0]      # 점수 사용자 지정해야 함
-    data['data_age'] = pd.cut(age, bins=bins, labels=labels, include_lowest=True).astype(float)
+
+    # 2010 ~ 2015, 2016 ~ 2020, 2021 ~ 2024
+    percentiles = np.percentile(age, [33, 66])
+
+    def assign(score: float) -> int:
+        if score <= percentiles[0]:
+            return 5
+        elif score <= percentiles[1]:
+            return 5
+        else:
+            return 1
+
+    # data_age 컬럼에 점수 저장
+    data['data_age_score'] = [assign(s) for s in age]
+
     return data
 
 
 def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-    
+
     scale_cols = COL_OPERATION  # operation 데이터는 모두 StandardScaler 로 scaling
 
     transformers = []
@@ -146,39 +198,44 @@ def make_models(model_id: int):
 
 def make_stacking(model_id: int, passthrough: bool):
     base, meta = make_models(model_id)
-    stack = StackingRegressor(estimators=base, final_estimator=meta, passthrough=passthrough)
+    estimators = [('base', base)]
+    stack = StackingRegressor(estimators=estimators, final_estimator=meta, passthrough=passthrough)
     return stack
 
 
 def get_param_space(model_id: int) -> Dict[str, Any]:
     if model_id == 1:
         return {
-            "base__n_estimators": (200, 600),
+            "base__n_estimators": (50, 300),
             "base__max_depth": (3, 20),
             "base__min_samples_split": (2, 20),
-            "base__min_samples_leaf": (1, 10)
+            "base__min_samples_leaf": (1, 10),
+            "final_estimator__alpha": (0.01, 100)
         }
     elif model_id == 2:
         return {
-            "base__n_estimators": (200, 800),
+            "base__n_estimators": (50, 300),
             "base__max_depth": (3, 12),
             "base__learning_rate": (1e-3, 0.3),
             "base__subsample": (0.6, 1.0),
-            "base__colsample_bytree": (0.6, 1.0)
+            "base__colsample_bytree": (0.6, 1.0),
+            "final_estimator__alpha": (0.01, 100)
         }
     elif model_id == 3:
         return {
-            "base__n_estimators": (100, 600),
+            "base__n_estimators": (50, 300),
             "base__learning_rate": (1e-3, 0.3),
             "base__max_depth": (2, 6),
-            "base__subsample": (0.6, 1.0)
+            "base__subsample": (0.6, 1.0),
+            "final_estimator__alpha": (0.01, 100)
         }
     elif model_id == 4:
         return {
             "base__learning_rate": (1e-3, 0.5),
             "base__max_depth": (2, 16),
             "base__max_bins": (64, 256),
-            "base__l2_regularization": (0.0, 2.0)
+            "base__l2_regularization": (0.001, 2.0),
+            "final_estimator__alpha": (0.01, 100)
         }
     else:
         raise ValueError("MODEL_ID 는 1~4")
@@ -209,15 +266,15 @@ def main():
     # data load, 변환, 파생변수컬럼 생성
     df = load_and_prepare('data.csv')
     # 파생변수 컬럼 추가 생성
-    df = create_weather_score(df)
-    df = create_data_age(df)
-    # 모델에 포함시키지 않을 컬럼 삭제
-    df.drop(columns=['year'], inplace=True, errors='raise')
+    df, weather_percentiles = create_weather_score(df)
+    df = create_data_age(df)    # year 컬럼을 사용함
+    # year 컬럼 삭제
+    df.drop(columns='year', inplace=True, errors='raise')
     # 파생변수를 포함한 데이터셋 저장 -> 사용자가 파생변수값을 확인할 수 있다.
     df.to_csv('data3.csv')
-    
+
     ####
-    #### 분석에 사용하는 파생변수: weather_bad_ratio(한달간 날씨 안좋은날 비율), weather_score(날씨가 얼마나 안좋은지 가중치 점수화), data_age(데이터 연도별 가중치)
+    #### 분석에 사용하는 파생변수: weather_bad_ratio(한달간 날씨 안좋은날 비율), weather_score(날씨가 얼마나 안좋은지 점수화), data_age(데이터 연도별 가중치)
     ####
 
     # X, y 저장
@@ -242,9 +299,9 @@ def main():
             scores = cross_val_score(pipe, X_train, y_train, scoring="r2", cv=kf, n_jobs=None)
             return float(np.mean(scores))
 
-        study.optimize(objective, n_trials=50, show_progress_bar=False)
+        study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=False)
         best_params = study.best_params     # 최적 훈련파라메터 저장
-        pipe.set_params(**{f"model__{k}": v for k, v in best_params.items()})   # 최적파라메터를 pipe 에 입력        
+        pipe.set_params(**{f"model__{k}": v for k, v in best_params.items()})   # 최적파라메터를 pipe 에 입력
         with open(OUTPUT_DIR / f"bestparam_model_{MODEL_ID}.json", "w", encoding="utf-8") as f:
             json.dump(best_params, f, ensure_ascii=False, indent=2)     # 최적 파라메터를 json 파일에 저장(/input 폴더에 복사해놓고 수정한다음 USE_OPTUNA=False 로 수동훈련 가능)
 
@@ -297,6 +354,29 @@ def main():
     with open(OUTPUT_DIR / "run_meta.json", "w", encoding="utf-8-sig") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)    # run_meta.json 은 방금 실행한 run 관련 정보를 담고 있음. 매 실행시 덮어쓰기됨.
 
+    return weather_percentiles
+
+
+def main2():
+    # 모델 파일 불러오기
+    model_loaded = joblib.load(OUTPUT_DIR / f"stacking_model_{MODEL_ID}.joblib")
+    df = load_and_prepare('data_new.csv')
+    # weather_score, data_age_score 파생변수 컬럼 생성
+    df = create_weather_score_for_predict_new(df, weather_percentiles)
+    df['data_age_score'] = 5.0  # 최신데이터라면 모두 5점 준다.
+    # year 컬럼 삭제
+    df.drop(columns='year', inplace=True, errors='raise')
+    # 파생변수를 포함한 데이터셋 저장 -> 사용자가 파생변수값을 확인할 수 있다.
+    df.to_csv('data3_new.csv')
+    # X, y 저장
+    y_new = df.pop("작업가능일수").values
+    X_new = df
+    # 새로운 데이터로 predict 한 결과를 출력
+    y_pred = model_loaded.predict(X_new)
+    metrics_predict = evaluate(y_new, y_pred)
+    print("[PREDICT ]", metrics_predict)
+    pd.DataFrame([metrics_predict]).to_csv(OUTPUT_DIR / "metrics_predict.csv", index=False, encoding="utf-8-sig")
 
 if __name__ == "__main__":
-    main()
+    weather_percentiles = main()
+    main2()
